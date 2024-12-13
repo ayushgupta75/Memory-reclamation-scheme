@@ -1,104 +1,181 @@
-#include <atomic>
-#include <vector>
-#include <list>
-#include <thread>
 #include <iostream>
-#include <climits>
+#include <atomic>
+#include <thread>
+#include <vector>
+#include <chrono>
+#include <mutex>
+#include <list>
+#include <unordered_map>
+#include <random>
 
-// A tagged pointer structure for IBR
-struct TaggedPointer {
-    std::atomic<uint64_t> born_before; // Epoch of allocation
-    std::atomic<void*> ptr;            // Pointer to the memory block
+// Memory management API for IBR
+class IBRManager {
+public:
+    struct Node {
+        int value;
+        std::atomic<Node*> left{nullptr};
+        std::atomic<Node*> right{nullptr};
+        std::atomic<int> birth_epoch{0};
+        std::atomic<int> retire_epoch{-1};
+    };
 
-    // Constructor
-    TaggedPointer() : born_before(0), ptr(nullptr) {}
+    static std::atomic<int> global_epoch;
+    thread_local static int local_epoch;
+    thread_local static std::list<Node*> retired_nodes;
 
-    // Protected Compare-and-Swap
-    bool protectedCAS(void* expected, void* desired, uint64_t birth_epoch) {
-        while (true) {
-            uint64_t current_epoch = born_before.load(std::memory_order_relaxed);
-            if (birth_epoch > current_epoch) {
-                born_before.compare_exchange_weak(current_epoch, birth_epoch);
-            }
-            if (ptr.compare_exchange_weak(expected, desired)) {
-                return true;
-            }
-        }
+    static void start_op() {
+        local_epoch = global_epoch.load();
     }
-};
 
-// A simple block structure with metadata
-struct Block {
-    uint64_t birth_epoch;
-    uint64_t retire_epoch;
-    void* data;
+    static void end_op() {
+        local_epoch = -1;  // Reset epoch
+    }
 
-    Block() : birth_epoch(0), retire_epoch(0), data(nullptr) {}
-};
+    static Node* allocate_node(int value) {
+        Node* node = new Node();
+        node->value = value;
+        node->birth_epoch = global_epoch.load();
+        return node;
+    }
 
-// Global epoch counter and thread-local variables
-std::atomic<uint64_t> global_epoch{0};
-thread_local uint64_t thread_epoch = 0;
-thread_local std::list<Block*> retired_blocks;
+    static void retire_node(Node* node) {
+        node->retire_epoch = global_epoch.load();
+        retired_nodes.push_back(node);
+        clean_up();
+    }
 
-constexpr int epoch_increment_frequency = 100;
-constexpr int empty_frequency = 10;
-
-// Memory allocation function
-Block* allocBlock(size_t size) {
-    Block* block = new Block();
-    block->data = malloc(size);
-    block->birth_epoch = global_epoch.load(std::memory_order_relaxed);
-    return block;
-}
-
-// Retire a block for reclamation
-void retireBlock(Block* block) {
-    block->retire_epoch = global_epoch.load(std::memory_order_relaxed);
-    retired_blocks.push_back(block);
-    if (retired_blocks.size() % empty_frequency == 0) {
-        for (auto it = retired_blocks.begin(); it != retired_blocks.end();) {
-            if ((*it)->retire_epoch < thread_epoch) {
-                free((*it)->data);
-                delete *it;
-                it = retired_blocks.erase(it);
+    static void clean_up() {
+        for (auto it = retired_nodes.begin(); it != retired_nodes.end();) {
+            Node* node = *it;
+            if (node->retire_epoch.load() < get_min_active_epoch()) {
+                delete node;
+                it = retired_nodes.erase(it);
             } else {
                 ++it;
             }
         }
     }
-}
 
-// Start of an operation
-void startOperation() {
-    thread_epoch = global_epoch.load(std::memory_order_relaxed);
-}
+private:
+    static int get_min_active_epoch() {
+        // Placeholder for the actual implementation to find the minimum active epoch.
+        return global_epoch.load() - 2;  // Example heuristic.
+    }
+};
 
-// End of an operation
-void endOperation() {
-    thread_epoch = UINT64_MAX;
+std::atomic<int> IBRManager::global_epoch{0};
+thread_local int IBRManager::local_epoch = -1;
+thread_local std::list<IBRManager::Node*> IBRManager::retired_nodes;
+
+// Lock-free Bonsai Tree Implementation
+class BonsaiTree {
+public:
+    BonsaiTree() {
+        root = IBRManager::allocate_node(-1);  // Dummy root node
+    }
+
+    void insert(int value) {
+        IBRManager::start_op();
+        Node* new_node = IBRManager::allocate_node(value);
+        Node* current = root;
+
+        while (true) {
+            if (value < current->value) {
+                Node* left = current->left.load();
+                if (!left) {
+                    if (current->left.compare_exchange_weak(left, new_node)) {
+                        break;
+                    }
+                } else {
+                    current = left;
+                }
+            } else {
+                Node* right = current->right.load();
+                if (!right) {
+                    if (current->right.compare_exchange_weak(right, new_node)) {
+                        break;
+                    }
+                } else {
+                    current = right;
+                }
+            }
+        }
+        IBRManager::end_op();
+    }
+
+    void remove(int value) {
+        IBRManager::start_op();
+        Node* parent = nullptr;
+        Node* current = root;
+        bool is_left_child = false;
+
+        while (current && current->value != value) {
+            parent = current;
+            if (value < current->value) {
+                current = current->left.load();
+                is_left_child = true;
+            } else {
+                current = current->right.load();
+                is_left_child = false;
+            }
+        }
+
+        if (!current) {
+            IBRManager::end_op();
+            return;  // Value not found
+        }
+
+        IBRManager::retire_node(current);
+        if (is_left_child) {
+            parent->left.store(nullptr);
+        } else {
+            parent->right.store(nullptr);
+        }
+
+        IBRManager::end_op();
+    }
+
+private:
+    using Node = IBRManager::Node;
+    Node* root;
+};
+
+// Benchmarking
+void benchmark(int thread_count, int total_operations) {
+    BonsaiTree tree;
+    std::atomic<int> operation_count{0};
+    std::vector<std::thread> threads;
+    auto start_time = std::chrono::high_resolution_clock::now();
+
+    for (int i = 0; i < thread_count; ++i) {
+        threads.emplace_back([&]() {
+            std::mt19937 rng(std::random_device{}());
+            std::uniform_int_distribution<int> dist(0, 1000);
+
+            while (operation_count.load() < total_operations) {
+                tree.insert(dist(rng));
+                tree.remove(dist(rng));
+                operation_count.fetch_add(2);
+            }
+        });
+    }
+
+    for (auto& thread : threads) {
+        thread.join();
+    }
+
+    auto end_time = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double> elapsed = end_time - start_time;
+    double throughput = static_cast<double>(total_operations) / elapsed.count();
+    std::cout << "Threads: " << thread_count << " | Throughput: " << throughput << " ops/sec" << std::endl;
 }
 
 int main() {
-    // Example usage
+    int thread_counts[] = {1, 2, 4, 8, 16};
+    int total_operations = 100000; // Define total number of operations
 
-    // Thread increments global epoch periodically
-    std::thread epoch_incrementer([] {
-        while (true) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            global_epoch.fetch_add(1, std::memory_order_relaxed);
-        }
-    });
-
-    // Example: Allocation and retirement
-    startOperation();
-    Block* block = allocBlock(128);
-    std::cout << "Allocated block at epoch: " << block->birth_epoch << std::endl;
-
-    retireBlock(block);
-    std::cout << "Retired block at epoch: " << block->retire_epoch << std::endl;
-    endOperation();
-
-    epoch_incrementer.join();
+    for (int thread_count : thread_counts) {
+        benchmark(thread_count, total_operations);
+    }
     return 0;
 }
