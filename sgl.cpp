@@ -5,6 +5,80 @@
 #include <iostream>
 #include <thread>
 #include <chrono>
+#include <list>
+#include <shared_mutex>
+#include <optional>
+#include <functional>
+
+// A thread-safe implementation of an unordered map
+template <typename Key, typename Value>
+class SGLUnorderedMap {
+private:
+    struct Bucket {
+        std::list<std::pair<Key, Value>> data;
+        mutable std::shared_mutex mutex;
+
+        std::optional<Value> find(const Key& key) const {
+            std::shared_lock lock(mutex);
+            for (const auto& kv : data) {
+                if (kv.first == key) {
+                    return kv.second;
+                }
+            }
+            return std::nullopt;
+        }
+
+        void insert_or_assign(const Key& key, const Value& value) {
+            std::unique_lock lock(mutex);
+            for (auto& kv : data) {
+                if (kv.first == key) {
+                    kv.second = value;
+                    return;
+                }
+            }
+            data.emplace_back(key, value);
+        }
+
+        bool erase(const Key& key) {
+            std::unique_lock lock(mutex);
+            for (auto it = data.begin(); it != data.end(); ++it) {
+                if (it->first == key) {
+                    data.erase(it);
+                    return true;
+                }
+            }
+            return false;
+        }
+    };
+
+    std::vector<Bucket> buckets;
+    std::hash<Key> hasher;
+
+    Bucket& get_bucket(const Key& key) {
+        size_t index = hasher(key) % buckets.size();
+        return buckets[index];
+    }
+
+    const Bucket& get_bucket(const Key& key) const {
+        size_t index = hasher(key) % buckets.size();
+        return buckets[index];
+    }
+
+public:
+    explicit SGLUnorderedMap(size_t bucket_count = 16) : buckets(bucket_count) {}
+
+    std::optional<Value> find(const Key& key) const {
+        return get_bucket(key).find(key);
+    }
+
+    void insert_or_assign(const Key& key, const Value& value) {
+        get_bucket(key).insert_or_assign(key, value);
+    }
+
+    bool erase(const Key& key) {
+        return get_bucket(key).erase(key);
+    }
+};
 
 // Hyaline Node Structure
 struct Node {
@@ -67,16 +141,18 @@ void traverse(Node* start) {
     }
 }
 
-// Test Node Allocation and Benchmark
-void benchmark_thread(int slot, int num_operations) {
+// Test with SGLUnorderedMap
+void benchmark_thread(int slot, int num_operations, SGLUnorderedMap<int, int>& map) {
     Node* handle = enter(slot);
 
     for (int i = 0; i < num_operations; ++i) {
-        // Allocate a new node
-        Node* node = new Node(new int(i));
+        int key = i;
+        int value = i * 10;
+        map.insert_or_assign(key, value); // Simulate insert or update operation
 
-        // Retire the node (simulate deletion)
-        retire(slot, node);
+        if (i % 2 == 0) {
+            map.erase(key); // Simulate delete operation for even keys
+        }
     }
 
     leave(slot, handle);
@@ -88,11 +164,12 @@ int main() {
     constexpr int num_threads = 8;
     constexpr int num_operations = 1000;
     std::vector<std::thread> threads;
+    SGLUnorderedMap<int, int> map; // Initialize SGLUnorderedMap
 
     auto start_time = std::chrono::high_resolution_clock::now();
 
     for (int i = 0; i < num_threads; ++i) {
-        threads.emplace_back(benchmark_thread, i % MAX_SLOTS, num_operations);
+        threads.emplace_back(benchmark_thread, i % MAX_SLOTS, num_operations, std::ref(map));
     }
 
     for (auto& thread : threads) {
@@ -103,7 +180,7 @@ int main() {
     std::chrono::duration<double> duration = end_time - start_time;
 
     double throughput = (num_threads * num_operations) / duration.count();
-    std::cout << "Benchmark complete. Throughput: " << throughput << " operations per second." << std::endl;
+    std::cout << "Hyaline Benchmark with SGLUnorderedMap complete. Throughput: " << throughput << " operations per second." << std::endl;
 
     return 0;
 }
