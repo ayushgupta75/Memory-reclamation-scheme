@@ -1,163 +1,175 @@
-#include <iostream>
-#include <unordered_map>
 #include <atomic>
-#include <thread>
 #include <vector>
+#include <memory>
+#include <mutex>
+#include <iostream>
+#include <thread>
 #include <chrono>
-#include <random>
 #include <list>
 #include <shared_mutex>
+#include <optional>
+#include <functional>
 
-class IBRManager {
-public:
-    struct Node {
-        int key;
-        int value;
-        std::atomic<int> birth_epoch;
-        std::atomic<int> retire_epoch;
-
-        Node(int k, int v) : key(k), value(v), birth_epoch(0), retire_epoch(-1) {}
-    };
-
-    static std::atomic<int> global_epoch;
-    thread_local static int local_epoch;
-    thread_local static std::list<Node*> retired_nodes;
-
-    static void start_op() {
-        local_epoch = global_epoch.load();
-    }
-
-    static void end_op() {
-        local_epoch = -1;
-    }
-
-    static void retire_node(Node* node) {
-        node->retire_epoch = global_epoch.load();
-        retired_nodes.push_back(node);
-        clean_up();
-    }
-
-    static void clean_up() {
-        for (auto it = retired_nodes.begin(); it != retired_nodes.end();) {
-            Node* node = *it;
-            if (node->retire_epoch < get_min_active_epoch()) {
-                delete node;
-                it = retired_nodes.erase(it);
-            } else {
-                ++it;
-            }
-        }
-    }
-
-private:
-    static int get_min_active_epoch() {
-        // Placeholder for finding the minimum active epoch.
-        return global_epoch.load() - 2; // Example heuristic
-    }
-};
-
-std::atomic<int> IBRManager::global_epoch{0};
-thread_local int IBRManager::local_epoch = -1;
-thread_local std::list<IBRManager::Node*> retired_nodes;
-
-class LockFreeUnorderedMap {
+// A thread-safe implementation of an unordered map
+template <typename Key, typename Value>
+class SGLUnorderedMap {
 private:
     struct Bucket {
-        std::atomic<IBRManager::Node*> head{nullptr};
+        std::list<std::pair<Key, Value>> data;
+        mutable std::shared_mutex mutex;
+
+        std::optional<Value> find(const Key& key) const {
+            std::shared_lock lock(mutex);
+            for (const auto& kv : data) {
+                if (kv.first == key) {
+                    return kv.second;
+                }
+            }
+            return std::nullopt;
+        }
+
+        void insert_or_assign(const Key& key, const Value& value) {
+            std::unique_lock lock(mutex);
+            for (auto& kv : data) {
+                if (kv.first == key) {
+                    kv.second = value;
+                    return;
+                }
+            }
+            data.emplace_back(key, value);
+        }
+
+        bool erase(const Key& key) {
+            std::unique_lock lock(mutex);
+            for (auto it = data.begin(); it != data.end(); ++it) {
+                if (it->first == key) {
+                    data.erase(it);
+                    return true;
+                }
+            }
+            return false;
+        }
     };
 
     std::vector<Bucket> buckets;
-    static const int BUCKET_COUNT = 1024;
+    std::hash<Key> hasher;
 
-    static bool compare_and_set(std::atomic<IBRManager::Node*>& ref, IBRManager::Node* expected, IBRManager::Node* desired) {
-        return ref.compare_exchange_weak(expected, desired, std::memory_order_release, std::memory_order_relaxed);
+    Bucket& get_bucket(const Key& key) {
+        size_t index = hasher(key) % buckets.size();
+        return buckets[index];
     }
 
-    size_t hash(int key) const {
-        return std::hash<int>{}(key) % BUCKET_COUNT;
+    const Bucket& get_bucket(const Key& key) const {
+        size_t index = hasher(key) % buckets.size();
+        return buckets[index];
     }
 
 public:
-    LockFreeUnorderedMap() : buckets(BUCKET_COUNT) {}
+    explicit SGLUnorderedMap(size_t bucket_count = 16) : buckets(bucket_count) {}
 
-    void insert(int key, int value) {
-        IBRManager::start_op();
-        size_t index = hash(key);
-        IBRManager::Node* new_node = new IBRManager::Node(key, value);
-        new_node->birth_epoch = IBRManager::global_epoch.load();
-
-        while (true) {
-            IBRManager::Node* head = buckets[index].head.load();
-            new_node->retire_epoch = head;
-            if (compare_and_set(buckets[index].head, head, new_node)) {
-                break;
-            }
-        }
-
-        IBRManager::end_op();
+    std::optional<Value> find(const Key& key) const {
+        return get_bucket(key).find(key);
     }
 
-    bool remove(int key) {
-        IBRManager::start_op();
-        size_t index = hash(key);
-
-        while (true) {
-            IBRManager::Node* head = buckets[index].head.load();
-            if (!head) {
-                IBRManager::end_op();
-                return false; // Key not found
-            }
-
-            if (head->key == key) {
-                IBRManager::Node* next = head->retire_epoch;
-                if (compare_and_set(buckets[index].head, head, next)) {
-                    IBRManager::retire_node(head);
-                    IBRManager::end_op();
-                    return true;
-                }
-            } else {
-                head = head->retire_epoch;
-            }
-        }
+    void insert_or_assign(const Key& key, const Value& value) {
+        get_bucket(key).insert_or_assign(key, value);
     }
 
-    bool find(int key) {
-        IBRManager::start_op();
-        size_t index = hash(key);
-        IBRManager::Node* current = buckets[index].head.load();
-
-        while (current) {
-            if (current->key == key) {
-                IBRManager::end_op();
-                return true; // Key found
-            }
-            current = current->retire_epoch;
-        }
-
-        IBRManager::end_op();
-        return false; // Key not found
+    bool erase(const Key& key) {
+        return get_bucket(key).erase(key);
     }
 };
 
-// Benchmarking
-void benchmark(int thread_count, int total_operations) {
-    LockFreeUnorderedMap lf_map;
-    std::atomic<int> operation_count{0};
+// Hyaline Node Structure
+struct Node {
+    std::atomic<int> ref_count; // Reference counter
+    Node* next;                // Pointer to the next node
+    void* data;                // Node data
+
+    Node(void* data) : ref_count(0), next(nullptr), data(data) {}
+};
+
+// Hyaline Global State
+constexpr int MAX_SLOTS = 128;
+std::atomic<int> global_refs[MAX_SLOTS];
+std::atomic<Node*> head[MAX_SLOTS];
+
+void initialize_hyaline() {
+    for (int i = 0; i < MAX_SLOTS; ++i) {
+        global_refs[i].store(0);
+        head[i].store(nullptr);
+    }
+}
+
+// Enter function to mark a thread's activity in a slot
+Node* enter(int slot) {
+    global_refs[slot].fetch_add(1, std::memory_order_relaxed);
+    return head[slot].load(std::memory_order_acquire);
+}
+
+// Leave function to update references and perform reclamation
+void leave(int slot, Node* handle) {
+    Node* current = head[slot].load(std::memory_order_acquire);
+    global_refs[slot].fetch_sub(1, std::memory_order_relaxed);
+
+    while (current && current != handle) {
+        Node* next = current->next;
+        if (current->ref_count.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+            delete current; // Free memory when no references exist
+        }
+        current = next;
+    }
+}
+
+// Retire a node
+void retire(int slot, Node* node) {
+    node->ref_count.store(global_refs[slot].load(std::memory_order_acquire), std::memory_order_relaxed);
+    Node* old_head = head[slot].load(std::memory_order_relaxed);
+    do {
+        node->next = old_head;
+    } while (!head[slot].compare_exchange_weak(old_head, node, std::memory_order_release, std::memory_order_relaxed));
+}
+
+// Helper function to perform traversal and clean up
+void traverse(Node* start) {
+    while (start) {
+        Node* next = start->next;
+        if (start->ref_count.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+            delete start; // Free memory
+        }
+        start = next;
+    }
+}
+
+// Test with SGLUnorderedMap
+void benchmark_thread(int slot, int num_operations, SGLUnorderedMap<int, int>& map) {
+    Node* handle = enter(slot);
+
+    for (int i = 0; i < num_operations; ++i) {
+        int key = i;
+        int value = i * 10;
+        map.insert_or_assign(key, value); // Simulate insert or update operation
+
+        if (i % 2 == 0) {
+            map.erase(key); // Simulate delete operation for even keys
+        }
+    }
+
+    leave(slot, handle);
+}
+
+int main() {
+    initialize_hyaline();
+
+    constexpr int num_threads = 8;
+    constexpr int num_operations = 1000;
     std::vector<std::thread> threads;
+    SGLUnorderedMap<int, int> map; // Initialize SGLUnorderedMap
+
     auto start_time = std::chrono::high_resolution_clock::now();
 
-    for (int i = 0; i < thread_count; ++i) {
-        threads.emplace_back([&]() {
-            std::mt19937 rng(std::random_device{}());
-            std::uniform_int_distribution<int> dist(0, 1000);
-
-            while (operation_count.load() < total_operations) {
-                int key = dist(rng);
-                lf_map.insert(key, dist(rng));
-                lf_map.remove(key);
-                operation_count.fetch_add(2);
-            }
-        });
+    for (int i = 0; i < num_threads; ++i) {
+        threads.emplace_back(benchmark_thread, i % MAX_SLOTS, num_operations, std::ref(map));
     }
 
     for (auto& thread : threads) {
@@ -165,17 +177,10 @@ void benchmark(int thread_count, int total_operations) {
     }
 
     auto end_time = std::chrono::high_resolution_clock::now();
-    std::chrono::duration<double> elapsed = end_time - start_time;
-    double throughput = static_cast<double>(total_operations) / elapsed.count();
-    std::cout << "Threads: " << thread_count << " | Throughput: " << throughput << " ops/sec" << std::endl;
-}
+    std::chrono::duration<double> duration = end_time - start_time;
 
-int main() {
-    int thread_counts[] = {1, 2, 4, 8, 16};
-    int total_operations = 10000; // Define total number of operations
+    double throughput = (num_threads * num_operations) / duration.count();
+    std::cout << "Hyaline Benchmark with SGLUnorderedMap complete. Throughput: " << throughput << " operations per second." << std::endl;
 
-    for (int thread_count : thread_counts) {
-        benchmark(thread_count, total_operations);
-    }
     return 0;
 }
