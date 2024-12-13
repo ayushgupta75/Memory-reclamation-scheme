@@ -1,82 +1,75 @@
 #include <iostream>
 #include <vector>
 #include <thread>
-#include <mutex>
+#include <atomic>
 #include <chrono>
 #include <random>
-#include <shared_mutex>
-#include <atomic>
+#include <memory>
 
-// Bonsai Tree Node
+// Lock-free Bonsai Tree Node
 struct BonsaiNode {
     int key;
-    BonsaiNode* left;
-    BonsaiNode* right;
+    std::atomic<BonsaiNode*> left;
+    std::atomic<BonsaiNode*> right;
 
     BonsaiNode(int k) : key(k), left(nullptr), right(nullptr) {}
 };
 
-// Bonsai Tree Class
-class BonsaiTree {
+// Lock-free Bonsai Tree Class
+class LockFreeBonsaiTree {
 private:
-    BonsaiNode* root;
-    std::shared_mutex tree_mutex;
+    std::atomic<BonsaiNode*> root;
 
-    void insert(BonsaiNode*& node, int key) {
-        if (!node) {
-            node = new BonsaiNode(key);
-            return;
+    void insert(std::atomic<BonsaiNode*>& node, int key) {
+        BonsaiNode* expected = node.load(std::memory_order_relaxed);
+
+        if (!expected) {
+            BonsaiNode* new_node = new BonsaiNode(key);
+            if (node.compare_exchange_strong(expected, new_node, std::memory_order_release, std::memory_order_relaxed)) {
+                return;
+            }
+            delete new_node; // CAS failed, delete the allocated node
         }
-        if (key < node->key) {
-            insert(node->left, key);
+
+        if (key < expected->key) {
+            insert(expected->left, key);
         } else {
-            insert(node->right, key);
+            insert(expected->right, key);
         }
     }
 
-    bool find(BonsaiNode* node, int key) {
-        if (!node) return false;
-        if (node->key == key) return true;
-        if (key < node->key) return find(node->left, key);
-        return find(node->right, key);
+    bool find(std::atomic<BonsaiNode*>& node, int key) {
+        BonsaiNode* current = node.load(std::memory_order_acquire);
+        while (current) {
+            if (current->key == key) return true;
+            current = (key < current->key) ? current->left.load(std::memory_order_acquire) : current->right.load(std::memory_order_acquire);
+        }
+        return false;
     }
 
 public:
-    BonsaiTree() : root(nullptr) {}
+    LockFreeBonsaiTree() : root(nullptr) {}
 
     void insert(int key) {
-        std::unique_lock lock(tree_mutex);
         insert(root, key);
     }
 
     bool find(int key) {
-        std::shared_lock lock(tree_mutex);
         return find(root, key);
     }
 };
 
-// Hyaline Schema
-class Hyaline {
+// Lock-Free Hyaline Schema
+class LockFreeHyaline {
 private:
-    BonsaiTree tree;
-    std::vector<int> values;
-    std::shared_mutex values_mutex;
+    LockFreeBonsaiTree tree;
     std::atomic<int> processed_count{0};
 
 public:
-    void addValue(int value) {
-        std::unique_lock lock(values_mutex);
-        values.push_back(value);
-    }
-
-    void processValues() {
-        std::unique_lock lock(values_mutex);
-        for (int value : values) {
-            int transformed = value * 2; // Example transformation
-            tree.insert(transformed);
-            processed_count.fetch_add(1, std::memory_order_relaxed);
-        }
-        values.clear();
+    void processValue(int value) {
+        int transformed = value * 2; // Example transformation
+        tree.insert(transformed);
+        processed_count.fetch_add(1, std::memory_order_relaxed);
     }
 
     bool checkValue(int value) {
@@ -89,7 +82,7 @@ public:
 };
 
 // Benchmark Function
-void benchmark(Hyaline& hyaline, int thread_count, int operations) {
+void benchmark(LockFreeHyaline& hyaline, int thread_count, int operations) {
     auto task = [&hyaline, operations](int thread_id) {
         std::random_device rd;
         std::mt19937 gen(rd());
@@ -97,10 +90,8 @@ void benchmark(Hyaline& hyaline, int thread_count, int operations) {
 
         for (int i = 0; i < operations; ++i) {
             int value = dist(gen);
-            hyaline.addValue(value);
+            hyaline.processValue(value);
         }
-
-        hyaline.processValues();
     };
 
     std::vector<std::thread> threads;
@@ -127,7 +118,7 @@ void benchmark(Hyaline& hyaline, int thread_count, int operations) {
 }
 
 int main() {
-    Hyaline hyaline;
+    LockFreeHyaline hyaline;
 
     int thread_count = 4;
     int operations_per_thread = 1000;
