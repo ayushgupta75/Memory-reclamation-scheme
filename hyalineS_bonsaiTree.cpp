@@ -104,7 +104,7 @@ public:
 // Benchmark function
 void benchmark(int numThreads, BonsaiTree& tree) {
     auto start = std::chrono::high_resolution_clock::now();
-    int totalOps = 0;
+    int totalOps = 10000 * numThreads;
 
     std::vector<std::thread> threads;
     for (int t = 0; t < numThreads; ++t) {
@@ -128,17 +128,21 @@ void benchmark(int numThreads, BonsaiTree& tree) {
     std::chrono::duration<double> duration = end - start;
     double throughput = totalOps / duration.count();
 
-    std::cout << "Threads: " << numThreads
-              << ", Time: " << duration.count() << "s"
-              << ", Throughput: " << throughput << " ops/s\n";
+    std::cout << "Throughput: " << throughput << " ops/s\n";
 }
 
-int main() {
+int main(int argc, char* argv[]) {
+    int threads;
+    if (argc == 2) {
+        threads = std::stoi(argv[1]);
+    }
+    else {
+        threads = 4;
+    }
+    std::cout << "The thread count is: " << threads << std::endl;
     BonsaiTree tree;
 
-    for (int threads = 1; threads <= MAX_THREADS; threads *= 2) {
-        benchmark(threads, tree);
-    }
+    benchmark(threads, tree);
 
     return 0;
 }
