@@ -171,11 +171,10 @@ void benchmark(int thread_count, int total_operations) {
 }
 
 int main() {
-    int thread_counts[] = {1, 2, 4, 8, 16};
-    int total_operations = 100000; // Define total number of operations
+    int thread_count = 4;
+    int total_operations = 10000; // Define total number of operations
 
-    for (int thread_count : thread_counts) {
-        benchmark(thread_count, total_operations);
-    }
+    benchmark(thread_count, total_operations);
+
     return 0;
 }
