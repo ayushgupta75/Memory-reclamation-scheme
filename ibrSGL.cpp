@@ -6,7 +6,7 @@
 #include <chrono>
 #include <random>
 #include <list>
-#include <shared_mutex>
+#include <mutex>
 
 class IBRManager {
 public:
@@ -58,90 +58,57 @@ private:
 
 std::atomic<int> IBRManager::global_epoch{0};
 thread_local int IBRManager::local_epoch = -1;
-thread_local std::list<IBRManager::Node*> retired_nodes;
+thread_local std::list<IBRManager::Node*> IBRManager::retired_nodes;
 
-class LockFreeUnorderedMap {
+class SGLUnorderedMap {
 private:
-    struct Bucket {
-        std::atomic<IBRManager::Node*> head{nullptr};
-    };
-
-    std::vector<Bucket> buckets;
-    static const int BUCKET_COUNT = 1024;
-
-    static bool compare_and_set(std::atomic<IBRManager::Node*>& ref, IBRManager::Node* expected, IBRManager::Node* desired) {
-        return ref.compare_exchange_weak(expected, desired, std::memory_order_release, std::memory_order_relaxed);
-    }
-
-    size_t hash(int key) const {
-        return std::hash<int>{}(key) % BUCKET_COUNT;
-    }
+    std::unordered_map<int, IBRManager::Node*> map;
+    std::mutex global_lock;
 
 public:
-    LockFreeUnorderedMap() : buckets(BUCKET_COUNT) {}
-
     void insert(int key, int value) {
         IBRManager::start_op();
-        size_t index = hash(key);
-        IBRManager::Node* new_node = new IBRManager::Node(key, value);
-        new_node->birth_epoch = IBRManager::global_epoch.load();
+        std::lock_guard<std::mutex> lock(global_lock);
 
-        while (true) {
-            IBRManager::Node* head = buckets[index].head.load();
-            new_node->retire_epoch = head;
-            if (compare_and_set(buckets[index].head, head, new_node)) {
-                break;
-            }
+        auto it = map.find(key);
+        if (it != map.end()) {
+            IBRManager::retire_node(it->second);
         }
 
+        map[key] = new IBRManager::Node(key, value);
+        map[key]->birth_epoch = IBRManager::global_epoch.load();
         IBRManager::end_op();
     }
 
     bool remove(int key) {
         IBRManager::start_op();
-        size_t index = hash(key);
+        std::lock_guard<std::mutex> lock(global_lock);
 
-        while (true) {
-            IBRManager::Node* head = buckets[index].head.load();
-            if (!head) {
-                IBRManager::end_op();
-                return false; // Key not found
-            }
-
-            if (head->key == key) {
-                IBRManager::Node* next = head->retire_epoch;
-                if (compare_and_set(buckets[index].head, head, next)) {
-                    IBRManager::retire_node(head);
-                    IBRManager::end_op();
-                    return true;
-                }
-            } else {
-                head = head->retire_epoch;
-            }
+        auto it = map.find(key);
+        if (it != map.end()) {
+            IBRManager::retire_node(it->second);
+            map.erase(it);
+            IBRManager::end_op();
+            return true;
         }
+
+        IBRManager::end_op();
+        return false;
     }
 
     bool find(int key) {
         IBRManager::start_op();
-        size_t index = hash(key);
-        IBRManager::Node* current = buckets[index].head.load();
+        std::lock_guard<std::mutex> lock(global_lock);
 
-        while (current) {
-            if (current->key == key) {
-                IBRManager::end_op();
-                return true; // Key found
-            }
-            current = current->retire_epoch;
-        }
-
+        bool found = map.find(key) != map.end();
         IBRManager::end_op();
-        return false; // Key not found
+        return found;
     }
 };
 
 // Benchmarking
 void benchmark(int thread_count, int total_operations) {
-    LockFreeUnorderedMap lf_map;
+    SGLUnorderedMap sgl_map;
     std::atomic<int> operation_count{0};
     std::vector<std::thread> threads;
     auto start_time = std::chrono::high_resolution_clock::now();
@@ -153,8 +120,8 @@ void benchmark(int thread_count, int total_operations) {
 
             while (operation_count.load() < total_operations) {
                 int key = dist(rng);
-                lf_map.insert(key, dist(rng));
-                lf_map.remove(key);
+                sgl_map.insert(key, dist(rng));
+                sgl_map.remove(key);
                 operation_count.fetch_add(2);
             }
         });
