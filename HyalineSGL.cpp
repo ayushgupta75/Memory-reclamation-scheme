@@ -1,186 +1,205 @@
 #include <atomic>
-#include <vector>
-#include <memory>
-#include <mutex>
-#include <iostream>
 #include <thread>
-#include <chrono>
-#include <list>
-#include <shared_mutex>
+#include <vector>
+#include <iostream>
+#include <random>
+#include <unordered_map>
 #include <optional>
-#include <functional>
+#include <cassert>
 
-// A thread-safe implementation of an unordered map
-template <typename Key, typename Value>
+// Slot structure for maintaining retirement lists
+struct Slot {
+    std::atomic<int> refCount; // Global reference counter for this slot
+    std::atomic<void*> head;  // Head of the retired list
+
+    Slot() : refCount(0), head(nullptr) {}
+};
+
+class Hyaline {
+public:
+    Hyaline(int numSlots) : slots(numSlots), slotCount(numSlots) {}
+
+    // Enter the critical section
+    void* enter(int slotId) {
+        Slot& slot = slots[slotId];
+        slot.refCount.fetch_add(1, std::memory_order_relaxed);
+        return slot.head.load(std::memory_order_acquire);
+    }
+
+    // Leave the critical section
+    void leave(int slotId, void* handle) {
+        Slot& slot = slots[slotId];
+        auto head = slot.head.load(std::memory_order_acquire);
+        auto ref = slot.refCount.fetch_sub(1, std::memory_order_release);
+
+        if (ref == 1 && head) { // This thread may need to handle reclamation
+            traverseAndReclaim(slot, head);
+        }
+    }
+
+    // Retire a batch of objects
+    void retire(void* batchHead, int slotId) {
+        Slot& slot = slots[slotId];
+
+        void* prevHead = nullptr;
+        do {
+            prevHead = slot.head.load(std::memory_order_acquire);
+            *reinterpret_cast<void**>(batchHead) = prevHead;
+        } while (!slot.head.compare_exchange_weak(prevHead, batchHead, std::memory_order_release));
+    }
+
+private:
+    std::vector<Slot> slots;
+    const int slotCount;
+
+    // Traverse and reclaim retired objects
+    void traverseAndReclaim(Slot& slot, void* handle) {
+        void* current = slot.head.load(std::memory_order_acquire);
+
+        while (current && current != handle) {
+            void* next = *reinterpret_cast<void**>(current);
+            delete reinterpret_cast<char*>(current); // Assuming objects are dynamically allocated
+            current = next;
+        }
+
+        // Reset the head to indicate completion
+        if (slot.refCount.load(std::memory_order_acquire) == 0) {
+            slot.head.store(nullptr, std::memory_order_release);
+        }
+    }
+};
+
+// SGLUnorderedMap Implementation
+
+template <class K, class V>
 class SGLUnorderedMap {
 private:
-    struct Bucket {
-        std::list<std::pair<Key, Value>> data;
-        mutable std::shared_mutex mutex;
-
-        std::optional<Value> find(const Key& key) const {
-            std::shared_lock lock(mutex);
-            for (const auto& kv : data) {
-                if (kv.first == key) {
-                    return kv.second;
-                }
-            }
-            return std::nullopt;
+    // Simple test and set lock
+    inline void lockAcquire(int tid) {
+        int unlk = -1;
+        while (!lk.compare_exchange_strong(unlk, tid, std::memory_order_acq_rel)) {
+            unlk = -1; // compare_exchange puts the old value into unlk, so set it back
         }
-
-        void insert_or_assign(const Key& key, const Value& value) {
-            std::unique_lock lock(mutex);
-            for (auto& kv : data) {
-                if (kv.first == key) {
-                    kv.second = value;
-                    return;
-                }
-            }
-            data.emplace_back(key, value);
-        }
-
-        bool erase(const Key& key) {
-            std::unique_lock lock(mutex);
-            for (auto it = data.begin(); it != data.end(); ++it) {
-                if (it->first == key) {
-                    data.erase(it);
-                    return true;
-                }
-            }
-            return false;
-        }
-    };
-
-    std::vector<Bucket> buckets;
-    std::hash<Key> hasher;
-
-    Bucket& get_bucket(const Key& key) {
-        size_t index = hasher(key) % buckets.size();
-        return buckets[index];
+        assert(lk.load() == tid);
     }
 
-    const Bucket& get_bucket(const Key& key) const {
-        size_t index = hasher(key) % buckets.size();
-        return buckets[index];
+    inline void lockRelease(int tid) {
+        assert(lk == tid);
+        int unlk = -1;
+        lk.store(unlk, std::memory_order_release);
     }
+
+    std::unordered_map<K, V>* m = nullptr;
+    std::atomic<int> lk;
 
 public:
-    explicit SGLUnorderedMap(size_t bucket_count = 16) : buckets(bucket_count) {}
-
-    std::optional<Value> find(const Key& key) const {
-        return get_bucket(key).find(key);
+    SGLUnorderedMap() {
+        m = new std::unordered_map<K, V>();
+        lk.store(-1, std::memory_order_release);
     }
 
-    void insert_or_assign(const Key& key, const Value& value) {
-        get_bucket(key).insert_or_assign(key, value);
+    ~SGLUnorderedMap() {
+        delete m;
     }
 
-    bool erase(const Key& key) {
-        return get_bucket(key).erase(key);
+    bool insert(K key, V val, int tid) {
+        lockAcquire(tid);
+        auto v = m->emplace(key, val);
+        lockRelease(tid);
+        return v.second;
+    }
+
+    std::optional<V> put(K key, V val, int tid) {
+        std::optional<V> res = {};
+        lockAcquire(tid);
+        auto it = m->find(key);
+        if (it != m->end()) {
+            res = it->second;
+        }
+        (*m)[key] = val;
+        lockRelease(tid);
+        return res;
+    }
+
+    std::optional<V> replace(K key, V val, int tid) {
+        std::optional<V> res = {};
+        lockAcquire(tid);
+        auto v = m->find(key);
+        if (v != m->end()) {
+            res = v->second;
+            (*m)[key] = val;
+        }
+        lockRelease(tid);
+        return res;
+    }
+
+    std::optional<V> remove(K key, int tid) {
+        std::optional<V> res = {};
+        lockAcquire(tid);
+        auto v = m->find(key);
+        if (v != m->end()) {
+            res = v->second;
+            m->erase(key);
+        }
+        lockRelease(tid);
+        return res;
+    }
+
+    std::optional<V> get(K key, int tid) {
+        std::optional<V> res = {};
+        lockAcquire(tid);
+        auto v = m->find(key);
+        if (v != m->end()) {
+            res = v->second;
+        }
+        lockRelease(tid);
+        return res;
     }
 };
 
-// Hyaline Node Structure
-struct Node {
-    std::atomic<int> ref_count; // Reference counter
-    Node* next;                // Pointer to the next node
-    void* data;                // Node data
-
-    Node(void* data) : ref_count(0), next(nullptr), data(data) {}
-};
-
-// Hyaline Global State
-constexpr int MAX_SLOTS = 128;
-std::atomic<int> global_refs[MAX_SLOTS];
-std::atomic<Node*> head[MAX_SLOTS];
-
-void initialize_hyaline() {
-    for (int i = 0; i < MAX_SLOTS; ++i) {
-        global_refs[i].store(0);
-        head[i].store(nullptr);
+// Example usage of SGLUnorderedMap with Hyaline
+int main(int argc, char* argv[]) {
+    int threads;
+    if (argc == 2) {
+        threads = std::stoi(argv[1]);
     }
-}
-
-// Enter function to mark a thread's activity in a slot
-Node* enter(int slot) {
-    global_refs[slot].fetch_add(1, std::memory_order_relaxed);
-    return head[slot].load(std::memory_order_acquire);
-}
-
-// Leave function to update references and perform reclamation
-void leave(int slot, Node* handle) {
-    Node* current = head[slot].load(std::memory_order_acquire);
-    global_refs[slot].fetch_sub(1, std::memory_order_relaxed);
-
-    while (current && current != handle) {
-        Node* next = current->next;
-        if (current->ref_count.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-            delete current; // Free memory when no references exist
-        }
-        current = next;
+    else {
+        threads = 4;
     }
-}
-
-// Retire a node
-void retire(int slot, Node* node) {
-    node->ref_count.store(global_refs[slot].load(std::memory_order_acquire), std::memory_order_relaxed);
-    Node* old_head = head[slot].load(std::memory_order_relaxed);
-    do {
-        node->next = old_head;
-    } while (!head[slot].compare_exchange_weak(old_head, node, std::memory_order_release, std::memory_order_relaxed));
-}
-
-// Helper function to perform traversal and clean up
-void traverse(Node* start) {
-    while (start) {
-        Node* next = start->next;
-        if (start->ref_count.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-            delete start; // Free memory
-        }
-        start = next;
-    }
-}
-
-// Test with SGLUnorderedMap
-void benchmark_thread(int slot, int num_operations, SGLUnorderedMap<int, int>& map) {
-    Node* handle = enter(slot);
-
-    for (int i = 0; i < num_operations; ++i) {
-        int key = i;
-        int value = i * 10;
-        map.insert_or_assign(key, value); // Simulate insert or update operation
-
-        if (i % 2 == 0) {
-            map.erase(key); // Simulate delete operation for even keys
-        }
-    }
-
-    leave(slot, handle);
-}
-
-int main() {
-    initialize_hyaline();
-
-    constexpr int num_threads = 8;
-    constexpr int num_operations = 1000;
-    std::vector<std::thread> threads;
-    SGLUnorderedMap<int, int> map; // Initialize SGLUnorderedMap
-
+    std::cout << "The thread count is: " << threads << std::endl;
+    const int objects = 10000; // Number of objects to operate on
     auto start_time = std::chrono::high_resolution_clock::now();
+    Hyaline hyaline(threads);
+    SGLUnorderedMap<int, int> map;
 
-    for (int i = 0; i < num_threads; ++i) {
-        threads.emplace_back(benchmark_thread, i % MAX_SLOTS, num_operations, std::ref(map));
+    std::vector<std::thread> workers;
+
+    for (int i = 0; i < threads; ++i) {
+        workers.emplace_back([&map, &hyaline, i, objects, threads]() {
+            std::random_device rd;
+            std::mt19937 gen(rd());
+            std::uniform_int_distribution<> dis(1, objects);
+
+            for (int j = 0; j < objects / threads; ++j) {
+                int key = dis(gen);
+                int value = dis(gen);
+
+                if (j % 2 == 0) {
+                    map.insert(key, value, i);
+                } else {
+                    map.remove(key, i);
+                }
+            }
+        });
     }
 
-    for (auto& thread : threads) {
-        thread.join();
+    for (auto& worker : workers) {
+        worker.join();
     }
 
     auto end_time = std::chrono::high_resolution_clock::now();
-    std::chrono::duration<double> duration = end_time - start_time;
-
-    double throughput = (num_threads * num_operations) / duration.count();
-    std::cout << "Hyaline Benchmark with SGLUnorderedMap complete. Throughput: " << throughput << " operations per second." << std::endl;
-
+    std::chrono::duration<double> elapsed = end_time - start_time;
+    double throughput = static_cast<double>(objects) / elapsed.count();
+    std::cout << "Threads: " << threads << " | Throughput: " << throughput << " ops/sec" << std::endl;
     return 0;
 }
