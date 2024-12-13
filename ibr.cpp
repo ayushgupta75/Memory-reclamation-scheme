@@ -48,13 +48,21 @@ public:
         for (auto it = retired_nodes.begin(); it != retired_nodes.end();) {
             Node* node = *it;
             if (node->retire_epoch.load() < get_min_active_epoch()) {
-                delete node;
-                it = retired_nodes.erase(it);
+                delete node;  // Free memory
+                it = retired_nodes.erase(it);  // Remove from list
             } else {
                 ++it;
             }
         }
     }
+
+    static void final_clean_up() {
+        for (auto node : retired_nodes) {
+            delete node;
+        }
+        retired_nodes.clear();
+    }
+
 
 private:
     static int get_min_active_epoch() {
@@ -172,10 +180,13 @@ void benchmark(int thread_count, int total_operations) {
 
 int main() {
     int thread_counts[] = {1, 2, 4, 8, 16};
-    int total_operations = 100000; // Define total number of operations
+    int total_operations = 1000000; // Define total number of operations
 
     for (int thread_count : thread_counts) {
         benchmark(thread_count, total_operations);
     }
+
+    // Final clean-up of any residual retired nodes
+    IBRManager::final_clean_up();
     return 0;
 }
