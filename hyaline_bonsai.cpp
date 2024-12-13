@@ -176,7 +176,7 @@ int main(int argc, char* argv[]) {
     }
     std::cout << "The thread count is: " << threads << std::endl;
     const int objects = 10000; // Number of objects to operate on
-
+    auto start_time = std::chrono::high_resolution_clock::now();
     Hyaline hyaline(threads);
     BonsaiTree tree(hyaline, threads);
 
@@ -210,5 +210,9 @@ int main(int argc, char* argv[]) {
     }
 
     std::cout << "Hyaline Bonsai Tree test completed successfully." << std::endl;
+    auto end_time = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double> elapsed = end_time - start_time;
+    double throughput = static_cast<double>(objects) / elapsed.count();
+    std::cout << "Threads: " << threads << " | Throughput: " << throughput << " ops/sec" << std::endl;
     return 0;
 }
