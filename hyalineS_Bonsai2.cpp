@@ -6,11 +6,10 @@
 #include <random>
 
 constexpr int MAX_THREADS = 144;
-constexpr int NUM_OPERATIONS = 10000;
 
 struct Node {
     int key;
-    std::atomic<Node*> next{nullptr};
+    std::atomic<Node*> next{nullptr}; // Pointer to the next node
     Node(int k) : key(k) {}
 };
 
@@ -65,14 +64,14 @@ public:
     }
 };
 
-void benchmark(int numThreads, BonsaiTree& tree) {
+void benchmark(int numThreads, BonsaiTree& tree, int numOperations) {
     auto start = std::chrono::high_resolution_clock::now();
     int totalOps = 0;
 
     std::vector<std::thread> threads;
     for (int t = 0; t < numThreads; ++t) {
         threads.emplace_back([&]() {
-            for (int i = 0; i < NUM_OPERATIONS; ++i) {
+            for (int i = 0; i < numOperations; ++i) {
                 int key = rand() % 1000;
                 if (i % 2 == 0) {
                     tree.insert(key);
@@ -99,9 +98,10 @@ void benchmark(int numThreads, BonsaiTree& tree) {
 
 int main() {
     BonsaiTree tree;
+    int numOperations = 10000; // Define number of operations
 
     for (int threads = 1; threads <= MAX_THREADS; threads *= 2) {
-        benchmark(threads, tree);
+        benchmark(threads, tree, numOperations);
     }
 
     tree.cleanup(); // Free all remaining nodes
