@@ -5,6 +5,7 @@
 #include <chrono>
 #include <random>
 #include <shared_mutex>
+#include <atomic>
 
 // Bonsai Tree Node
 struct BonsaiNode {
@@ -60,6 +61,7 @@ private:
     BonsaiTree tree;
     std::vector<std::pair<int, int>> intervals;
     std::shared_mutex intervals_mutex;
+    std::atomic<int> processed_count{0};
 
 public:
     void addInterval(int start, int end) {
@@ -72,11 +74,17 @@ public:
         for (auto& interval : intervals) {
             int midpoint = (interval.first + interval.second) / 2;
             tree.insert(midpoint);
+            processed_count.fetch_add(1, std::memory_order_relaxed);
         }
+        intervals.clear();
     }
 
     bool checkValue(int value) {
         return tree.find(value);
+    }
+
+    int getProcessedCount() const {
+        return processed_count.load(std::memory_order_relaxed);
     }
 };
 
@@ -97,6 +105,8 @@ void benchmark(IBR& ibr, int thread_count, int operations) {
     };
 
     std::vector<std::thread> threads;
+    auto start = std::chrono::high_resolution_clock::now();
+
     for (int i = 0; i < thread_count; ++i) {
         threads.emplace_back(task, i);
     }
@@ -104,6 +114,17 @@ void benchmark(IBR& ibr, int thread_count, int operations) {
     for (auto& thread : threads) {
         thread.join();
     }
+
+    auto end = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double> elapsed = end - start;
+
+    int total_processed = ibr.getProcessedCount();
+    double throughput = total_processed / elapsed.count();
+
+    std::cout << "Benchmark completed in " << elapsed.count() << " seconds with "
+              << thread_count << " threads." << std::endl;
+    std::cout << "Total processed: " << total_processed << ", Throughput: "
+              << throughput << " operations/second." << std::endl;
 }
 
 int main() {
@@ -112,13 +133,7 @@ int main() {
     int thread_count = 4;
     int operations_per_thread = 1000;
 
-    auto start = std::chrono::high_resolution_clock::now();
     benchmark(ibr, thread_count, operations_per_thread);
-    auto end = std::chrono::high_resolution_clock::now();
-
-    std::chrono::duration<double> elapsed = end - start;
-    std::cout << "Benchmark completed in " << elapsed.count() << " seconds with "
-              << thread_count << " threads." << std::endl;
 
     return 0;
 }
