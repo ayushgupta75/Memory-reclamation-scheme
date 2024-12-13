@@ -134,10 +134,10 @@ void benchmark(int numThreads, SGLUnorderedMap& map) {
 
 int main() {
     SGLUnorderedMap map;
-
-    for (int threads = 1; threads <= MAX_THREADS; threads *= 2) {
-        benchmark(threads, map);
-    }
+    int threads = 4;
+//    for (int threads = 1; threads <= MAX_THREADS; threads *= 2) {
+    benchmark(threads, map);
+//    }
 
     return 0;
 }
