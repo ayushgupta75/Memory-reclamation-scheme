@@ -166,8 +166,15 @@ private:
     }
 };
 
-int main() {
-    const int threads = 2; // Number of threads
+int main(int argc, char* argv[]) {
+    int threads;
+    if (argc == 2) {
+        threads = std::stoi(argv[1]);
+    }
+    else {
+        threads = 4;
+    }
+    std::cout << "The thread count is: " << threads << std::endl;
     const int objects = 10000; // Number of objects to operate on
 
     Hyaline hyaline(threads);

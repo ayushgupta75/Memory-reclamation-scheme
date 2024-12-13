@@ -178,8 +178,16 @@ void benchmark(int thread_count, int total_operations) {
     std::cout << "Threads: " << thread_count << " | Throughput: " << throughput << " ops/sec" << std::endl;
 }
 
-int main() {
-    int thread_count = 4;
+int main(int argc, char* argv[]) {
+    int thread_count;
+    if (argc == 2) {
+        thread_count = std::stoi(argv[1]);
+    }
+    else {
+        thread_count = 4;
+    }
+    std::cout << "The thread count is: " << thread_count << std::endl;
+    
     int total_operations = 10000; // Define total number of operations
 
     benchmark(thread_count, total_operations);
