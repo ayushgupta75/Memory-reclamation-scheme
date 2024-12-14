@@ -46,7 +46,7 @@ Dependencies: Standard C++ libraries; no additional external dependencies.
 Running
 
 Compile the code:
-g++ -std=c++17 -O3 -pthread -o ibr_hyaline main.cpp
+g++ -std=c++17 -O3 -pthread -o hyaline hyaline.cpp
 
 Run the program:
-./ibr_hyaline
+./hyaline
