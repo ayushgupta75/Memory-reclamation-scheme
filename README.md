@@ -49,4 +49,24 @@ Compile the code:
 g++ -std=c++17 -O3 -pthread -o hyaline hyaline.cpp
 
 Run the program:
-./hyaline
+
+	We have 4 different executables, one for each combination between benchmark and memory reclamation scheme. The four are:
+
+	hyaline_bonsai
+	hyaline_sgl
+	ibr_bonsai
+	ibr_sgl
+
+To get results, we ran them this way:
+
+./hyaline_bonsai #of_threads
+
+Example: ./hyaline_bonsai 16
+	This would run the benchmark for hyaline with a bonsai tree with 16 threads
+
+This gives our throughput metric, but the following is how we got our metric on unreclaimed memory blocks.
+
+For this we run our code using valgrind
+
+Example: valgrind ./hyaline_bonsai 16
+	This would run the benchmark for hyaline with a bonsai tree with 16 threads through valgrind, and would give the number of unreclaimed memory blocks
